@@ -1,189 +1,183 @@
-# Calculadora/Utilitário Remoto com Sockets TCP
+# Calculadora/Utilitário Remoto com Sockets TCP: versões single-thread e multithread
 
-Exercício 1 de Sistemas Distribuídos (UFG). Extensão do exemplo cliente-servidor com sockets TCP
-da Fig. 2.3 (Cap. 2) do livro *Distributed Systems*, de Tanenbaum & van Steen.
+Sistemas Distribuídos (UFG). Extensão do exemplo cliente-servidor com sockets TCP da Fig. 2.3
+(Cap. 2) do livro *Distributed Systems*, de Tanenbaum & van Steen.
 
-O servidor oferece **7 operações** (4 numéricas e 3 de texto) que o cliente chama remotamente,
-e **cada requisição pode conter várias operações diferentes**, executadas em lote.
+- **ASR 04:** calculadora remota em que cada requisição carrega um **lote de operações**
+  (4 numéricas e 3 de texto). Versão *single-threaded* (`server_st.py`, `client_st.py`).
+- **ASR 05:** versão **multithread** (`server_mt.py`, `client_mt.py`), geração automática de
+  requisições aleatórias e experimento de desempenho comparando três configurações.
+  O relato do experimento está em **[RELATO.md](RELATO.md)**.
 
-## Arquitetura
+Só há dois componentes: **cliente** e **servidor**. Apenas a biblioteca padrão do Python 3 é usada
+(o `graficos.py` usa também o `matplotlib`).
+
+## Arquivos
+
+| Arquivo            | Papel |
+|--------------------|-------|
+| `constCS.py`       | `HOST` e `PORT` padrão (`localhost:5678`). |
+| `protocolo.py`     | Enquadramento: JSON em UTF-8 terminado em `\n`, leitura com buffer. |
+| `operacoes.py`     | Lógica das 7 operações e do processamento do lote. **Usado pelos dois servidores**, que por isso dão respostas idênticas. |
+| `server_st.py`     | Servidor single-threaded (ASR 04): atende uma conexão por vez. |
+| `server_mt.py`     | Servidor multithread: **uma thread nova por requisição**. |
+| `client_st.py`     | Cliente single-threaded: modo interativo, `--demo` e modo automático (sequencial); uma conexão por lote/requisição. |
+| `client_mt.py`     | Cliente multithread: **uma thread nova por requisição** (modo automático). |
+| `cliente_comum.py` | Código comum do modo automático dos clientes (envio, estatísticas, relatório). |
+| `gerador.py`       | Gera N requisições aleatórias reprodutíveis (`--seed`). |
+| `verificar.py`     | Verificação funcional: ST × MT, 2 servidores, casos de erro, nenhuma requisição perdida. |
+| `benchmark.py`     | Experimento automático (sobe servidores, roda clientes, mede, salva CSV). |
+| `graficos.py`      | Gera os gráficos em `results/` a partir de `results/resumo.csv`. |
+| `results/`         | `resultados.csv` (cada execução), `resumo.csv` (média e desvio), gráficos `.png` e `complementar/` (variação de `--max-concurrent`). |
+
+## Arquitetura de threads
+
+**Servidor MT** (`server_mt.py`): a thread principal faz `accept()`, lê a requisição da conexão
+aceita e cria uma `threading.Thread` que processa, envia a resposta e fecha a conexão. A thread
+principal volta imediatamente ao `accept()`, sem `join()`.
 
 ```
- ┌───────────── cliente ─────────────┐          ┌───────────── servidor ─────────────┐
- │ monta um lote de operações        │  TCP     │ accept() → lê uma linha JSON        │
- │ {"ops": [op1, op2, ...]}  ────────┼─────────►│ para cada op do lote:               │
- │                                   │          │   tabela de despacho → função       │
- │ imprime um resultado por op ◄─────┼──────────┤ {"results": [res1, res2, ...]}      │
- └───────────────────────────────────┘          └─────────────────────────────────────┘
+principal:  accept ─► lê requisição ─► Thread(atender).start() ─► accept ─► ...
+                                            │
+thread k:                                   └─► processa (+ delay) ─► responde ─► close
 ```
 
-| Arquivo        | Papel |
-|----------------|-------|
-| `constCS.py`   | `HOST` e `PORT` usados pelos dois lados (padrão: `localhost:5678`). |
-| `protocolo.py` | Enquadramento das mensagens: envio de JSON terminado em `\n` e leitura com buffer. |
-| `server.py`    | Servidor: socket `AF_INET`/`SOCK_STREAM`, tabela de despacho e processamento do lote. |
-| `client.py`    | Cliente: modo interativo e modo de demonstração (`--demo`). |
+**Cliente MT** (`client_mt.py`): para cada requisição, a thread principal cria uma thread nova,
+que abre a conexão, envia, espera a resposta e guarda resposta e latência. Um
+`threading.Semaphore(--max-concurrent)` limita quantas dessas threads ficam ativas ao mesmo tempo,
+para não esgotar portas locais nem o backlog do servidor. Ao final, `join()` em todas.
+Cada thread grava a resposta na própria posição de uma lista pré-alocada; latências e falhas
+vão para listas compartilhadas protegidas por `threading.Lock`.
 
-O servidor mantém a estrutura do exemplo do livro (`socket` → `bind` → `listen` → `accept` →
-`recv`/`send`), com duas extensões:
+**Padrão de conexão:** em todos os modos, **os clientes abrem uma conexão TCP nova para cada
+requisição** (conecta, envia, recebe, fecha). No interativo e no `--demo`, isso vale para cada
+lote enviado. O servidor MT segue o modelo visto em aula (uma requisição por conexão) e o
+servidor ST atende esse padrão sem mudanças, então **todos os modos do cliente funcionam com os
+dois servidores**. Nos experimentos, a única diferença entre as configurações é o uso de threads.
 
-- fica em laço aceitando **várias conexões em sequência** (um cliente por vez, sem threads);
-- em cada conexão, atende **várias requisições** até o cliente fechar o socket.
-
-Apenas a biblioteca padrão do Python 3 é usada.
+**Atraso simulado:** os dois servidores aceitam `--delay-ms` (padrão 0), aplicado por requisição
+com `time.sleep` em `operacoes.processar_requisicao`. Ele representa trabalho de I/O, como uma
+consulta a banco.
 
 ## Protocolo de aplicação
 
-### Enquadramento
+Cada mensagem é **um objeto JSON numa única linha terminada por `\n`** (o TCP não preserva
+fronteiras de mensagem; o receptor acumula bytes até achar o `\n`). Limite de 1 MiB por mensagem.
 
-O TCP é um fluxo de bytes e não preserva fronteiras de mensagem: um `recv(1024)` pode devolver
-meia mensagem ou duas mensagens juntas. Por isso, **cada mensagem é um objeto JSON em UTF-8
-numa única linha, terminado por `\n`**. O receptor acumula bytes num buffer até encontrar o `\n`
-(classe `LeitorDeLinhas` em `protocolo.py`). Assim mensagens grandes (a demo envia ~48 KB)
-chegam inteiras. Há um limite de 1 MiB por mensagem para proteger a memória do servidor.
-
-### Requisição
+Requisição:
 
 ```json
-{"ops": [
-  {"op": "add",   "args": [2, 3]},
-  {"op": "upper", "args": ["ola"]}
-]}
+{"ops": [{"op": "add", "args": [2, 3]}, {"op": "upper", "args": ["ola"]}]}
 ```
 
-### Resposta
-
-Um resultado por operação, **na mesma ordem** da requisição:
+Resposta (um resultado por operação, na mesma ordem):
 
 ```json
-{"results": [
-  {"op": "add",   "ok": true, "result": 5},
-  {"op": "upper", "ok": true, "result": "OLA"}
-]}
+{"results": [{"op": "add", "ok": true, "result": 5}, {"op": "upper", "ok": true, "result": "OLA"}]}
 ```
 
-Se uma operação falhar, só ela é marcada com erro; as outras são executadas normalmente:
-
-```json
-{"results": [
-  {"op": "div", "ok": false, "error": "divisão por zero"},
-  {"op": "add", "ok": true,  "result": 300}
-]}
-```
-
-Se a requisição inteira for inválida (JSON malformado ou sem a lista `"ops"`), a resposta é um
-erro único, e a conexão continua aberta para as próximas requisições:
-
-```json
-{"ok": false, "error": "JSON inválido: Expecting ',' delimiter"}
-```
+Uma operação com erro é marcada sozinha (`{"op": "div", "ok": false, "error": "divisão por zero"}`)
+e as demais são executadas. Requisição inteira inválida (JSON malformado, sem `"ops"`, maior que
+1 MiB) recebe um erro único: `{"ok": false, "error": "..."}`.
 
 ## Operações
 
-| Operação      | Argumentos               | Retorno                         | Possíveis erros |
-|---------------|--------------------------|---------------------------------|-----------------|
-| `add`         | `a`, `b` (números)       | `a + b`                         | nº de argumentos ≠ 2; argumento não numérico |
-| `sub`         | `a`, `b` (números)       | `a - b`                         | nº de argumentos ≠ 2; argumento não numérico |
-| `mul`         | `a`, `b` (números)       | `a * b`                         | nº de argumentos ≠ 2; argumento não numérico |
-| `div`         | `a`, `b` (números)       | `a / b` (sempre float)          | nº de argumentos ≠ 2; argumento não numérico; divisão por zero |
-| `upper`       | `texto` (string)         | texto em maiúsculas             | nº de argumentos ≠ 1; argumento não é texto |
-| `reverse`     | `texto` (string)         | texto invertido                 | nº de argumentos ≠ 1; argumento não é texto |
-| `count_words` | `texto` (string)         | quantidade de palavras (inteiro)| nº de argumentos ≠ 1; argumento não é texto |
+| Operação      | Argumentos         | Retorno                          | Possíveis erros |
+|---------------|--------------------|----------------------------------|-----------------|
+| `add`         | `a`, `b` (números) | `a + b`                          | nº de argumentos ≠ 2; argumento não numérico |
+| `sub`         | `a`, `b` (números) | `a - b`                          | idem |
+| `mul`         | `a`, `b` (números) | `a * b`                          | idem |
+| `div`         | `a`, `b` (números) | `a / b` (float)                  | idem; divisão por zero |
+| `upper`       | `texto`            | texto em maiúsculas              | nº de argumentos ≠ 1; argumento não é texto |
+| `reverse`     | `texto`            | texto invertido                  | idem |
+| `count_words` | `texto`            | quantidade de palavras           | idem |
 
-Erros gerais: operação desconhecida (por item); JSON inválido e requisição sem `"ops"` (para a
-requisição inteira). Números são `int` ou `float` do JSON; `true`/`false` não são aceitos como números.
-
-Para **adicionar uma operação**, basta escrever a função em `server.py` e registrá-la no dicionário
-`OPERACOES`, que mapeia `nome → (função, número de argumentos)`.
+`true`/`false` não são aceitos como números. Para adicionar uma operação, escreva a função em
+`operacoes.py` e registre-a em `OPERACOES` (`nome → (função, nº de argumentos)`).
 
 ## Como executar
 
-Requer Python 3. Abra dois terminais na pasta do projeto.
+Requer Python 3. Abra terminais na pasta do projeto.
 
-**Terminal 1 — servidor:**
-
-```bash
-python3 server.py
-```
-
-**Terminal 2 — cliente em modo demonstração** (envia lotes de exemplo, incluindo casos de erro):
+### Uso manual: interativo e demonstração
 
 ```bash
-python3 client.py --demo
+python3 server_st.py               # terminal 1 (ou: python3 server_mt.py)
+python3 client_st.py --demo        # terminal 2: lotes de exemplo, com casos de erro
+python3 client_st.py               # terminal 2: modo interativo
 ```
 
-**Terminal 2 — cliente em modo interativo:**
+Os dois modos funcionam com qualquer um dos servidores, porque cada lote vai numa conexão nova.
+Para usar outro endereço: `python3 client_st.py --servers localhost:5679`. Se o servidor
+estiver fora do ar, o interativo avisa e mantém o lote para reenviar.
 
-```bash
-python3 client.py
-```
-
-No modo interativo você monta um lote e o envia:
+No modo interativo: `<op> <args...>` adiciona ao lote, `enviar`, `lote`, `limpar`, `ajuda`, `sair`.
 
 ```
 [0 op(s) no lote] > add 2 3
 [1 op(s) no lote] > upper "ola mundo"
-[2 op(s) no lote] > count_words "a b c"
-[3 op(s) no lote] > enviar
-Enviando: {"ops": [{"op": "add", "args": [2, 3]}, {"op": "upper", "args": ["ola mundo"]}, {"op": "count_words", "args": ["a b c"]}]}
+[2 op(s) no lote] > enviar
   [1] add          ok    -> 5
   [2] upper        ok    -> 'OLA MUNDO'
-  [3] count_words  ok    -> 3
 ```
 
-Comandos: `<op> <args...>`, `lote` (mostra o lote), `enviar`, `limpar`, `ajuda`, `sair`.
-Argumentos que parecem números são enviados como números; use aspas para textos com espaços.
+### Modo automático (requisições aleatórias)
 
-Encerre o servidor com `Ctrl+C`. Para rodar em máquinas diferentes, ajuste `HOST` em `constCS.py`
-para o IP do servidor.
+Parâmetros comuns aos dois clientes: `--n` (nº de requisições), `--seed` (semente; padrão 42),
+`--servers host:porta,host:porta` (round-robin; padrão `localhost:5678`) e `--json` (métricas em
+JSON). O cliente MT tem ainda `--max-concurrent` (padrão 64). Os servidores aceitam `--port`,
+`--delay-ms` e `--quiet` (não imprime cada requisição).
 
-## Exemplo de saída (`python3 client.py --demo`)
+```bash
+# Configuração A: cliente ST + servidor ST
+python3 server_st.py --delay-ms 10
+python3 client_st.py --n 1000 --seed 42
 
-```
-=== Lote 1: várias operações numéricas e de texto numa só requisição
-Enviando: {"ops": [{"op": "add", "args": [2, 3]}, {"op": "sub", "args": [10, 4.5]}, {"op": "mul", "args": [6, 7]}, {"op": "div", "args": [1, 4]}, {"op": "upper", "args": ["olá, mundo"]}, {"op": "reverse", "args": ["sistemas distribuídos"]}, {"op": "count_words", "args": ["o rato roeu a roupa do rei de roma"]}]}
-  [1] add          ok    -> 5
-  [2] sub          ok    -> 5.5
-  [3] mul          ok    -> 42
-  [4] div          ok    -> 0.25
-  [5] upper        ok    -> 'OLÁ, MUNDO'
-  [6] reverse      ok    -> 'sodíubirtsid sametsis'
-  [7] count_words  ok    -> 9
+# Configuração B: cliente ST + servidor MT
+python3 server_mt.py --delay-ms 10
+python3 client_st.py --n 1000 --seed 42
 
-=== Lote 2: erros por operação (as demais continuam funcionando)
-Enviando: {"ops": [{"op": "div", "args": [5, 0]}, {"op": "pow", "args": [2, 8]}, {"op": "add", "args": [1]}, {"op": "mul", "args": ["3", 4]}, {"op": "upper", "args": [123]}, {"op": "add", "args": [100, 200]}]}
-  [1] div          ERRO  -> divisão por zero
-  [2] pow          ERRO  -> operação desconhecida: 'pow'
-  [3] add          ERRO  -> 'add' espera 2 argumento(s), recebeu 1
-  [4] mul          ERRO  -> argumento '3' não é numérico
-  [5] upper        ERRO  -> argumento 123 não é texto
-  [6] add          ok    -> 300
+# Configuração C: cliente MT + servidor MT
+python3 server_mt.py --delay-ms 10
+python3 client_mt.py --n 1000 --seed 42 --max-concurrent 64
 
-=== Lote 3: mensagem grande (texto de ~50 KB, bem maior que recv(1024))
-Enviando: {"ops": [{"op": "count_words", "args": ["palavra palavra ..." (48000 caracteres)]}]}
-  [1] count_words  ok    -> 6000
-
-=== Lote 4: JSON inválido (o servidor responde erro e segue vivo)
-Enviando: {"ops": [{"op": "add", "args": [1, 2]
-  ERRO NA REQUISIÇÃO: JSON inválido: Expecting ',' delimiter
-
-=== Lote 5: formato errado (sem a chave "ops")
-Enviando: {"op": "add", "args": [1, 2]}
-  ERRO NA REQUISIÇÃO: requisição deve ter o formato {"ops": [...]}
-
-=== Lote 6: depois dos erros, a mesma conexão continua funcionando
-Enviando: {"ops": [{"op": "mul", "args": [3, 3]}, {"op": "reverse", "args": ["fim"]}]}
-  [1] mul          ok    -> 9
-  [2] reverse      ok    -> 'mif'
+# Cliente MT com dois servidores MT
+python3 server_mt.py --port 5678 &
+python3 server_mt.py --port 5679 &
+python3 client_mt.py --n 1000 --servers localhost:5678,localhost:5679
 ```
 
-## Como foi atendido o requisito "mais de uma funcionalidade por requisição"
+Exemplo de saída real (configuração C, servidor com `--delay-ms 10`):
 
-No exemplo original, cada mensagem do cliente produzia um único processamento (ecoar o texto com
-`*`). Aqui a requisição carrega uma **lista** de operações (`"ops"`), que podem ser de tipos
-diferentes — por exemplo, uma soma, uma divisão e uma conversão para maiúsculas na mesma
-mensagem. O servidor percorre a lista em ordem, despacha cada item para a função correspondente
-pela tabela `OPERACOES` e devolve uma lista `"results"` alinhada com a de entrada. Como cada
-operação é executada e validada isoladamente, um erro numa delas (divisão por zero, tipo errado,
-operação inexistente) não impede as demais nem derruba o servidor. Com isso, várias
-funcionalidades são acessadas em **uma única ida e volta pela rede**.
+```
+Cliente MT: 1000 requisições para localhost:5678 (seed=42)
+  sucessos: 1000   falhas: 0
+  tempo total: 0.620 s   vazão: 1611.8 req/s
+  latência (ms): média 13.06   p50 12.98   p95 14.59
+```
+
+Para ver as requisições que uma semente gera: `python3 gerador.py --n 5 --seed 42`.
+
+### Verificação funcional
+
+```bash
+python3 verificar.py
+```
+
+O script sobe um servidor ST e dois MT e envia as mesmas requisições (mesma seed) em várias
+combinações cliente/servidor. Em seguida compara as respostas **por id da requisição** com a
+referência ST→ST, testa os casos de erro nos dois servidores e confere que nenhuma requisição
+se perdeu.
+
+### Benchmark e gráficos
+
+```bash
+python3 benchmark.py                 # padrão: N=100,1000,5000; delay 0 e 10 ms; 5 repetições
+python3 -m venv .venv && .venv/bin/pip install matplotlib   # só uma vez
+.venv/bin/python graficos.py         # gera results/*.png
+```
+
+O `benchmark.py` sobe os servidores como subprocessos, espera ficarem prontos, roda o cliente,
+coleta as métricas (tempo total, vazão, latência média/p50/p95) e encerra os servidores, para
+cada combinação. As opções `--reps`, `--ns`, `--delays`, `--configs` e `--max-concurrent` mudam
+os parâmetros. Os resultados e a análise estão em [RELATO.md](RELATO.md).
