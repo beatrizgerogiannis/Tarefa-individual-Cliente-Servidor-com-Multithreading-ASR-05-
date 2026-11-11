@@ -1,0 +1,4 @@
+config,cliente,servidor,n_servidores,n,delay_ms,rep,max_concurrent,tempo_total_s,vazao_req_s,lat_media_ms,lat_p50_ms,lat_p95_ms,sucessos,falhas,python,so,cpu,nucleos
+C,client_mt.py,server_mt.py,1,1000,10.0,1,64,0.7093257960004848,1409.7894164268016,13.279353764068219,13.151589002518449,15.146508998441277,1000,0,3.12.3,Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39,Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz,12
+C,client_mt.py,server_mt.py,1,1000,10.0,2,64,0.6961614069987263,1436.4484873000574,13.325029569019534,13.132291998772416,15.346763000707142,1000,0,3.12.3,Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39,Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz,12
+C,client_mt.py,server_mt.py,1,1000,10.0,3,64,0.647964822997892,1543.2936550064126,13.153328331969533,13.03577499857056,14.684486999613,1000,0,3.12.3,Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39,Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz,12

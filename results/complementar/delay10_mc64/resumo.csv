@@ -1,0 +1,2 @@
+delay_ms,n,config,reps,falhas_total,tempo_total_s_media,tempo_total_s_desvio,vazao_req_s_media,vazao_req_s_desvio,lat_media_ms_media,lat_media_ms_desvio,lat_p50_ms_media,lat_p50_ms_desvio,lat_p95_ms_media,lat_p95_ms_desvio
+10.0,1000,C,3,0,0.684484008665701,0.0323042330945549,1463.1771862444239,70.65170160813081,13.252570555019096,0.08892881375770167,13.106551999953808,0.06204942813593767,15.05925299958714,0.33965067703206026
