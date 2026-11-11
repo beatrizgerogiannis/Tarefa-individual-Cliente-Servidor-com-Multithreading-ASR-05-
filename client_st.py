@@ -1,9 +1,27 @@
+# Cliente SINGLE-THREADED (versão da ASR 04 + modo automático).
+#
+# Modos:
+#   python3 client_st.py                 interativo
+#   python3 client_st.py --demo          demonstração com casos de erro
+#   python3 client_st.py --n 1000 --seed 42 [--servers h:p,h:p]
+#                                        automático: requisições aleatórias enviadas
+#                                        UMA DE CADA VEZ
+#
+# Em todos os modos, cada lote/requisição usa uma conexão TCP NOVA (conecta,
+# envia, recebe, fecha). Assim o cliente funciona tanto com server_st.py quanto
+# com server_mt.py, que atende uma requisição por conexão. No interativo e no
+# --demo, o servidor é o primeiro de --servers (padrão: HOST:PORT de constCS.py).
+
 from socket  import *
 from constCS import * #-
+import argparse
 import json
 import shlex
 import sys
-from protocolo import enviar_mensagem, enviar_linha_bruta, LeitorDeLinhas
+import time
+from protocolo import enviar_linha_bruta, LeitorDeLinhas
+from gerador import gerar_requisicoes
+import cliente_comum
 
 
 def mostrar_resposta(resposta):
@@ -18,15 +36,25 @@ def mostrar_resposta(resposta):
             print(f"  [{i}] {str(r.get('op')):<12} ERRO  -> {r['error']}")
 
 
-def requisitar(s, leitor, ops):
-    """Envia um lote de operações e espera a resposta."""
-    requisicao = {"ops": ops}
-    print(f"Enviando: {json.dumps(requisicao, ensure_ascii=False)}")
-    enviar_mensagem(s, requisicao)
-    resposta = leitor.ler_linha()
+def enviar_e_receber(endereco, texto):
+    """Abre uma conexão NOVA, envia uma linha, lê a resposta e fecha a conexão."""
+    s = socket(AF_INET, SOCK_STREAM)
+    s.connect(endereco)         # connect to server (block until accepted)
+    try:
+        enviar_linha_bruta(s, texto)
+        resposta = LeitorDeLinhas(s).ler_linha()
+    finally:
+        s.close()               # close the connection
     if resposta is None:
-        raise ConnectionError("servidor fechou a conexão")
-    mostrar_resposta(json.loads(resposta))
+        raise ConnectionError("servidor fechou a conexão sem responder")
+    return json.loads(resposta)
+
+
+def requisitar(endereco, ops, mostrar=None):
+    """Envia um lote de operações (numa conexão nova) e mostra a resposta."""
+    texto = json.dumps({"ops": ops}, ensure_ascii=False)
+    print(f"Enviando: {mostrar or texto}")
+    mostrar_resposta(enviar_e_receber(endereco, texto))
 
 
 # ---------------------------------------------------------------------------
@@ -57,30 +85,27 @@ LOTES_DEMO = [
 ]
 
 
-def modo_demo(s, leitor):
+def modo_demo(endereco):
     for titulo, ops in LOTES_DEMO:
         print(f"\n=== {titulo}")
         if titulo.startswith("Lote 3"):  # não imprime o texto gigante inteiro
-            enviar_mensagem(s, {"ops": ops})
-            print(f"Enviando: {{\"ops\": [{{\"op\": \"count_words\", \"args\": [\"palavra palavra ...\" ({len(ops[0]['args'][0])} caracteres)]}}]}}")
-            mostrar_resposta(json.loads(leitor.ler_linha()))
+            resumo = f"{{\"ops\": [{{\"op\": \"count_words\", \"args\": [\"palavra palavra ...\" ({len(ops[0]['args'][0])} caracteres)]}}]}}"
+            requisitar(endereco, ops, mostrar=resumo)
         else:
-            requisitar(s, leitor, ops)
+            requisitar(endereco, ops)
 
     print("\n=== Lote 4: JSON inválido (o servidor responde erro e segue vivo)")
     bruto = '{"ops": [{"op": "add", "args": [1, 2]'  # falta fechar colchetes/chaves
     print(f"Enviando: {bruto}")
-    enviar_linha_bruta(s, bruto)
-    mostrar_resposta(json.loads(leitor.ler_linha()))
+    mostrar_resposta(enviar_e_receber(endereco, bruto))
 
     print("\n=== Lote 5: formato errado (sem a chave \"ops\")")
     bruto = '{"op": "add", "args": [1, 2]}'
     print(f"Enviando: {bruto}")
-    enviar_linha_bruta(s, bruto)
-    mostrar_resposta(json.loads(leitor.ler_linha()))
+    mostrar_resposta(enviar_e_receber(endereco, bruto))
 
-    print("\n=== Lote 6: depois dos erros, a mesma conexão continua funcionando")
-    requisitar(s, leitor, [{"op": "mul", "args": [3, 3]}, {"op": "reverse", "args": ["fim"]}])
+    print("\n=== Lote 6: depois dos erros, o servidor continua atendendo normalmente")
+    requisitar(endereco, [{"op": "mul", "args": [3, 3]}, {"op": "reverse", "args": ["fim"]}])
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +133,9 @@ def converter_argumento(token):
     return token
 
 
-def modo_interativo(s, leitor):
+def modo_interativo(endereco):
     print(AJUDA)
+    print(f"Servidor: {endereco[0]}:{endereco[1]} (uma conexão nova a cada envio)")
     lote = []
     while True:
         try:
@@ -139,22 +165,53 @@ def modo_interativo(s, leitor):
             if not lote:
                 print("Lote vazio; adicione operações antes de enviar.")
                 continue
-            requisitar(s, leitor, lote)
-            lote = []
+            try:
+                requisitar(endereco, lote)
+                lote = []
+            except (OSError, ValueError) as e:  # servidor fora do ar, resposta inválida...
+                print(f"Falha ao falar com o servidor ({type(e).__name__}: {e}); o lote foi mantido.")
         else:
             # Qualquer outro comando vira uma operação; quem valida é o servidor.
             lote.append({"op": comando, "args": [converter_argumento(t) for t in partes[1:]]})
 
 
 # ---------------------------------------------------------------------------
+# Modo automático: N requisições aleatórias, enviadas em sequência (sem threads).
+# ---------------------------------------------------------------------------
 
-s = socket(AF_INET, SOCK_STREAM)
-s.connect((HOST, PORT)) # connect to server (block until accepted)
-leitor = LeitorDeLinhas(s)
-try:
-    if "--demo" in sys.argv:
-        modo_demo(s, leitor)
+def modo_automatico(args):
+    servidores = cliente_comum.ler_servidores(args.servers)
+    requisicoes = gerar_requisicoes(args.n, args.seed)  # gerado ANTES de medir
+    respostas = [None] * args.n
+    latencias, falhas = [], []
+
+    inicio = time.perf_counter()
+    for i, req in requisicoes:
+        endereco = servidores[i % len(servidores)]  # round-robin
+        try:
+            respostas[i], lat = cliente_comum.enviar_requisicao(endereco, req)
+            latencias.append(lat)
+        except Exception as e:
+            falhas.append((i, f"{type(e).__name__}: {e}"))
+    tempo_total = time.perf_counter() - inicio
+
+    cliente_comum.relatar(args, "ST", tempo_total, respostas, latencias, falhas)
+
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cliente single-threaded da calculadora remota")
+    parser.add_argument("--demo", action="store_true", help="envia lotes de demonstração")
+    cliente_comum.argumentos_automaticos(parser)
+    args = parser.parse_args()
+
+    if args.n is not None:
+        modo_automatico(args)
+        sys.exit(0)
+
+    endereco = cliente_comum.ler_servidores(args.servers)[0]
+    if args.demo:
+        modo_demo(endereco)
     else:
-        modo_interativo(s, leitor)
-finally:
-    s.close()               # close the connection
+        modo_interativo(endereco)
