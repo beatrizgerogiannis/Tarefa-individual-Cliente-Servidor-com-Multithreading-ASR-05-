@@ -1,13 +1,17 @@
-from socket  import *
-from constCS import * #-
-import json
-from protocolo import enviar_mensagem, LeitorDeLinhas
+# Lógica das operações da calculadora remota.
+#
+# Este módulo é usado pelas DUAS versões do servidor (server_st.py e
+# server_mt.py), para que ambas executem exatamente o mesmo código e, portanto,
+# deem exatamente as mesmas respostas. A única diferença entre elas é COMO as
+# requisições são atendidas (uma por vez ou uma thread por requisição).
+#
+# Nenhuma função daqui guarda estado global mutável: cada chamada trabalha só
+# com os próprios argumentos. Por isso elas podem ser chamadas por várias
+# threads ao mesmo tempo sem precisar de locks.
 
-# ---------------------------------------------------------------------------
-# Operações oferecidas pelo servidor.
-# Cada função recebe os argumentos já desempacotados e devolve o resultado,
-# ou lança ErroOperacao com uma mensagem amigável.
-# ---------------------------------------------------------------------------
+import json
+import time
+
 
 class ErroOperacao(Exception):
     """Erro de uma operação específica (não derruba o lote nem o servidor)."""
@@ -86,57 +90,25 @@ def executar_operacao(item):
         return {"op": nome, "ok": False, "error": f"erro interno: {e}"}
 
 
-def resumir(texto, limite=200):
-    """Encurta textos longos só para o log do servidor."""
-    return texto if len(texto) <= limite else texto[:limite] + f"... ({len(texto)} caracteres)"
+def processar_requisicao(linha, atraso_s=0.0):
+    """Interpreta uma linha JSON e processa TODAS as operações do lote, em ordem.
 
-
-def processar_requisicao(linha):
-    """Interpreta uma linha JSON e processa TODAS as operações do lote, em ordem."""
+    atraso_s simula trabalho de I/O por requisição (ex.: consulta a um banco de
+    dados). time.sleep bloqueia só a thread que o chama e LIBERA o GIL, então,
+    no servidor multithread, outras threads continuam trabalhando enquanto
+    esta "espera o banco".
+    """
+    if atraso_s > 0:
+        time.sleep(atraso_s)
     try:
         requisicao = json.loads(linha)
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"JSON inválido: {e.msg}"}
     if not isinstance(requisicao, dict) or not isinstance(requisicao.get("ops"), list):
         return {"ok": False, "error": "requisição deve ter o formato {\"ops\": [...]}"}
-    # Aqui está o ponto central do exercício: várias funcionalidades por requisição.
     return {"results": [executar_operacao(item) for item in requisicao["ops"]]}
 
 
-# ---------------------------------------------------------------------------
-# Laço principal (mesma estrutura do exemplo do livro: socket, bind, listen,
-# accept, recv/send), agora aceitando várias conexões em sequência.
-# ---------------------------------------------------------------------------
-
-s = socket(AF_INET, SOCK_STREAM)
-s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)  # permite reiniciar o servidor sem esperar a porta liberar
-s.bind((HOST, PORT))  #-
-s.listen(1)           #-
-print(f"Servidor ouvindo em {HOST}:{PORT} (Ctrl+C para encerrar)")
-
-try:
-  while True:                    # aceita um cliente por vez, para sempre
-    (conn, addr) = s.accept()    # returns new socket and addr. client
-    print(f"Conexão de {addr}")
-    leitor = LeitorDeLinhas(conn)
-    try:
-      while True:                # várias requisições na mesma conexão
-        try:
-          linha = leitor.ler_linha()
-        except ValueError as e:  # mensagem grande demais: avisa e encerra a conexão
-          enviar_mensagem(conn, {"ok": False, "error": str(e)})
-          break
-        if linha is None: break  # stop if client stopped
-        print(f"  <- {resumir(linha)}")
-        resposta = processar_requisicao(linha)
-        print(f"  -> {resumir(json.dumps(resposta, ensure_ascii=False))}")
-        enviar_mensagem(conn, resposta)
-    except OSError as e:         # cliente caiu no meio: segue atendendo os próximos
-      print(f"Erro na conexão com {addr}: {e}")
-    finally:
-      conn.close()               # close the connection
-      print(f"Conexão com {addr} encerrada")
-except KeyboardInterrupt:
-  print("\nServidor encerrado.")
-finally:
-  s.close()
+def resumir(texto, limite=200):
+    """Encurta textos longos só para o log do servidor."""
+    return texto if len(texto) <= limite else texto[:limite] + f"... ({len(texto)} caracteres)"
